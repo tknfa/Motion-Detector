@@ -4,7 +4,10 @@ use std::{
     fs::{self, File},
     io::BufWriter,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        mpsc::{Receiver, SyncSender, sync_channel},
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -44,32 +47,31 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     println!("Found {} camera(s) using {backend:?}.", cameras.len());
-    println!("Opening camera index {camera_index}.");
+    println!("Opening camera index {camera_index} on a dedicated capture thread.");
 
-    let requested =
-        RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
-    let mut camera = Camera::with_backend(CameraIndex::Index(camera_index), requested, backend)?;
+    let (receiver, capture_handle) = spawn_capture_thread(camera_index);
 
-    let resolution = camera.resolution();
-    println!(
-        "Resolved camera format: {}x{} at {} FPS.",
-        resolution.width(),
-        resolution.height(),
-        camera.frame_rate()
-    );
-    let camera_frame_rate = camera.frame_rate();
+    let run_result = (|| -> Result<(), Box<dyn Error>> {
+        let capture_info = wait_for_capture_start(&receiver)?;
+        println!(
+            "Resolved camera format: {}x{} at {} FPS.",
+            capture_info.width, capture_info.height, capture_info.frame_rate
+        );
 
-    camera.open_stream()?;
-    run_motion_detection(
-        &mut camera,
-        MotionDetectorConfig::default(),
-        ClipRecorderConfig::default(),
-        args.max_frames,
-        resolution.width(),
-        resolution.height(),
-        camera_frame_rate,
-    )?;
-    camera.stop_stream()?;
+        run_motion_detection(
+            receiver,
+            MotionDetectorConfig::default(),
+            ClipRecorderConfig::default(),
+            args.max_frames,
+            capture_info,
+        )
+    })();
+
+    if capture_handle.join().is_err() {
+        return Err("The capture thread panicked.".into());
+    }
+
+    run_result?;
 
     println!("Motion detection loop finished cleanly.");
     Ok(())
@@ -142,6 +144,94 @@ fn wait_for_camera_permission() -> Result<(), Box<dyn Error>> {
 
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+#[derive(Clone, Copy)]
+struct CaptureInfo {
+    width: u32,
+    height: u32,
+    frame_rate: u32,
+}
+
+struct CapturedFrame {
+    frame_number: usize,
+    rgb: RgbImage,
+}
+
+enum CaptureMessage {
+    Started(CaptureInfo),
+    Frame(CapturedFrame),
+    Error(String),
+}
+
+fn spawn_capture_thread(camera_index: u32) -> (Receiver<CaptureMessage>, thread::JoinHandle<()>) {
+    let (sender, receiver) = sync_channel(8);
+
+    let handle = thread::spawn(move || {
+        if let Err(error) = capture_loop(camera_index, &sender) {
+            let _ = sender.send(CaptureMessage::Error(error.to_string()));
+        }
+    });
+
+    (receiver, handle)
+}
+
+fn wait_for_capture_start(
+    receiver: &Receiver<CaptureMessage>,
+) -> Result<CaptureInfo, Box<dyn Error>> {
+    loop {
+        match receiver
+            .recv()
+            .map_err(|_| "The capture thread exited before sending startup info.")?
+        {
+            CaptureMessage::Started(info) => return Ok(info),
+            CaptureMessage::Error(message) => return Err(message.into()),
+            CaptureMessage::Frame(_) => {
+                return Err("The capture thread sent a frame before startup info.".into());
+            }
+        }
+    }
+}
+
+fn capture_loop(
+    camera_index: u32,
+    sender: &SyncSender<CaptureMessage>,
+) -> Result<(), Box<dyn Error>> {
+    let backend =
+        native_api_backend().ok_or("No native camera backend is available on this OS.")?;
+    let requested =
+        RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
+    let mut camera = Camera::with_backend(CameraIndex::Index(camera_index), requested, backend)?;
+    let resolution = camera.resolution();
+    let capture_info = CaptureInfo {
+        width: resolution.width(),
+        height: resolution.height(),
+        frame_rate: camera.frame_rate(),
+    };
+
+    camera.open_stream()?;
+
+    if sender.send(CaptureMessage::Started(capture_info)).is_err() {
+        let _ = camera.stop_stream();
+        return Ok(());
+    }
+
+    let mut frame_number = 0usize;
+    loop {
+        frame_number += 1;
+        let frame = camera.frame()?;
+        let rgb = frame.decode_image::<RgbFormat>()?;
+
+        if sender
+            .send(CaptureMessage::Frame(CapturedFrame { frame_number, rgb }))
+            .is_err()
+        {
+            break;
+        }
+    }
+
+    let _ = camera.stop_stream();
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -231,9 +321,9 @@ struct ClipRecorderConfig {
     output_dir: PathBuf,
     max_clip_width: u32,
     target_save_fps: u32,
-    pre_roll_seconds: usize,
-    post_roll_seconds: usize,
-    max_clip_seconds: usize,
+    pre_roll_duration: Duration,
+    post_roll_duration: Duration,
+    max_clip_duration: Duration,
 }
 
 impl Default for ClipRecorderConfig {
@@ -242,9 +332,9 @@ impl Default for ClipRecorderConfig {
             output_dir: PathBuf::from("clips"),
             max_clip_width: 320,
             target_save_fps: 8,
-            pre_roll_seconds: 2,
-            post_roll_seconds: 2,
-            max_clip_seconds: 12,
+            pre_roll_duration: Duration::from_millis(500),
+            post_roll_duration: Duration::from_millis(500),
+            max_clip_duration: Duration::from_secs(12),
         }
     }
 }
@@ -293,9 +383,9 @@ impl ClipRecorder {
             .unwrap_or(1)
             .max(1);
         let effective_fps = (source_fps / frame_stride as u32).max(1);
-        let pre_roll_frames = config.pre_roll_seconds * effective_fps as usize;
-        let post_roll_frames = config.post_roll_seconds * effective_fps as usize;
-        let max_clip_frames = config.max_clip_seconds * effective_fps as usize;
+        let pre_roll_frames = duration_to_frame_count(config.pre_roll_duration, effective_fps);
+        let post_roll_frames = duration_to_frame_count(config.post_roll_duration, effective_fps);
+        let max_clip_frames = duration_to_frame_count(config.max_clip_duration, effective_fps);
 
         Ok(Self {
             output_dir: config.output_dir,
@@ -387,7 +477,13 @@ impl ClipRecorder {
                 return self.finish_active_clip();
             }
 
-            if active_clip.still_frames >= self.post_roll_frames.max(1) {
+            let post_roll_reached = if self.post_roll_frames == 0 {
+                !analysis.motion_detected
+            } else {
+                active_clip.still_frames >= self.post_roll_frames
+            };
+
+            if post_roll_reached {
                 return self.finish_active_clip();
             }
         }
@@ -437,22 +533,24 @@ impl ClipRecorder {
 }
 
 fn run_motion_detection(
-    camera: &mut Camera,
+    receiver: Receiver<CaptureMessage>,
     motion_config: MotionDetectorConfig,
     clip_config: ClipRecorderConfig,
     max_frames: Option<usize>,
-    source_width: u32,
-    source_height: u32,
-    source_fps: u32,
+    capture_info: CaptureInfo,
 ) -> Result<(), Box<dyn Error>> {
     let mut detector = MotionDetector::new(motion_config);
-    let mut clip_recorder =
-        ClipRecorder::new(clip_config, source_width, source_height, source_fps)?;
+    let mut clip_recorder = ClipRecorder::new(
+        clip_config,
+        capture_info.width,
+        capture_info.height,
+        capture_info.frame_rate,
+    )?;
     let started_at = Instant::now();
-    let mut frame_number = 0usize;
+    let mut processed_frames = 0usize;
 
     println!(
-        "Single-thread motion detection is running.{}",
+        "Motion detection and clip saving are running on the main thread.{}",
         match max_frames {
             Some(limit) => format!(" It will stop after {limit} frames."),
             None => " Press Ctrl+C to stop.".to_string(),
@@ -477,14 +575,25 @@ fn run_motion_detection(
 
     loop {
         if let Some(limit) = max_frames {
-            if frame_number >= limit {
+            if processed_frames >= limit {
                 break;
             }
         }
 
-        frame_number += 1;
-        let frame = camera.frame()?;
-        let rgb = frame.decode_image::<RgbFormat>()?;
+        let message = match receiver.recv() {
+            Ok(message) => message,
+            Err(_) => break,
+        };
+
+        let captured_frame = match message {
+            CaptureMessage::Started(_) => continue,
+            CaptureMessage::Frame(captured_frame) => captured_frame,
+            CaptureMessage::Error(message) => return Err(message.into()),
+        };
+
+        processed_frames += 1;
+        let frame_number = captured_frame.frame_number;
+        let rgb = captured_frame.rgb;
         let sampled_grayscale = sample_rgb_frame_to_grayscale(
             rgb.as_raw(),
             rgb.width() as usize,
@@ -509,9 +618,9 @@ fn run_motion_detection(
     let _ = clip_recorder.finish_pending_clip()?;
 
     let elapsed_seconds = started_at.elapsed().as_secs_f64();
-    let fps = frame_number as f64 / elapsed_seconds.max(0.001);
+    let fps = processed_frames as f64 / elapsed_seconds.max(0.001);
     println!(
-        "Processed {frame_number} frames in {:.2} seconds ({fps:.1} FPS).",
+        "Processed {processed_frames} frames in {:.2} seconds ({fps:.1} FPS).",
         elapsed_seconds
     );
 
@@ -578,6 +687,14 @@ fn count_changed_pixels(previous_frame: &[u8], current_frame: &[u8], threshold: 
         .count()
 }
 
+fn duration_to_frame_count(duration: Duration, fps: u32) -> usize {
+    if duration.is_zero() {
+        return 0;
+    }
+
+    (duration.as_secs_f64() * f64::from(fps.max(1))).ceil() as usize
+}
+
 fn resize_for_clip(rgb_frame: &RgbImage, clip_width: u32, clip_height: u32) -> RgbaImage {
     let resized = image::imageops::resize(rgb_frame, clip_width, clip_height, FilterType::Triangle);
     DynamicImage::ImageRgb8(resized).into_rgba8()
@@ -605,8 +722,10 @@ fn write_gif_clip(
 #[cfg(test)]
 mod tests {
     use super::{
-        MotionDetector, MotionDetectorConfig, count_changed_pixels, sample_rgb_frame_to_grayscale,
+        MotionDetector, MotionDetectorConfig, count_changed_pixels, duration_to_frame_count,
+        sample_rgb_frame_to_grayscale,
     };
+    use std::time::Duration;
 
     #[test]
     fn rgb_sampling_picks_evenly_spaced_pixels() {
@@ -627,6 +746,11 @@ mod tests {
         let current = vec![10, 20, 40, 50];
 
         assert_eq!(count_changed_pixels(&previous, &current, 15), 2);
+    }
+
+    #[test]
+    fn half_second_roll_matches_four_frames_at_eight_fps() {
+        assert_eq!(duration_to_frame_count(Duration::from_millis(500), 8), 4);
     }
 
     #[test]
