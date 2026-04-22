@@ -1,13 +1,22 @@
 use std::{
+    collections::VecDeque,
     error::Error,
+    fs::{self, File},
+    io::BufWriter,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use image::{
+    Delay, DynamicImage, Frame, RgbImage, RgbaImage,
+    codecs::gif::{GifEncoder, Repeat},
+    imageops::FilterType,
+};
 use nokhwa::{
     Camera, native_api_backend, nokhwa_check, nokhwa_initialize,
-    pixel_format::{LumaFormat, RgbFormat},
+    pixel_format::RgbFormat,
     query,
     utils::{CameraIndex, RequestedFormat, RequestedFormatType},
 };
@@ -48,12 +57,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         resolution.height(),
         camera.frame_rate()
     );
+    let camera_frame_rate = camera.frame_rate();
 
     camera.open_stream()?;
     run_motion_detection(
         &mut camera,
         MotionDetectorConfig::default(),
+        ClipRecorderConfig::default(),
         args.max_frames,
+        resolution.width(),
+        resolution.height(),
+        camera_frame_rate,
     )?;
     camera.stop_stream()?;
 
@@ -166,22 +180,12 @@ impl MotionDetector {
         }
     }
 
-    fn analyze_frame(
-        &mut self,
-        grayscale_pixels: &[u8],
-        source_width: usize,
-        source_height: usize,
-    ) -> MotionAnalysis {
-        let sampled = sample_grayscale_frame(
-            grayscale_pixels,
-            source_width,
-            source_height,
-            self.config.sample_width,
-            self.config.sample_height,
-        );
-
-        let total_pixels = sampled.len();
-        let Some(previous_sample) = self.previous_sample.replace(sampled.clone()) else {
+    fn analyze_frame(&mut self, sampled_grayscale_pixels: Vec<u8>) -> MotionAnalysis {
+        let total_pixels = sampled_grayscale_pixels.len();
+        let Some(previous_sample) = self
+            .previous_sample
+            .replace(sampled_grayscale_pixels.clone())
+        else {
             return MotionAnalysis {
                 changed_pixels: 0,
                 total_pixels,
@@ -192,8 +196,11 @@ impl MotionDetector {
             };
         };
 
-        let changed_pixels =
-            count_changed_pixels(&previous_sample, &sampled, self.config.pixel_diff_threshold);
+        let changed_pixels = count_changed_pixels(
+            &previous_sample,
+            &sampled_grayscale_pixels,
+            self.config.pixel_diff_threshold,
+        );
         let motion_detected = changed_pixels >= self.config.min_changed_pixels;
         let motion_started = motion_detected && !self.motion_active;
         let motion_ended = !motion_detected && self.motion_active;
@@ -219,12 +226,228 @@ struct MotionAnalysis {
     warming_up: bool,
 }
 
+#[derive(Clone)]
+struct ClipRecorderConfig {
+    output_dir: PathBuf,
+    max_clip_width: u32,
+    target_save_fps: u32,
+    pre_roll_seconds: usize,
+    post_roll_seconds: usize,
+    max_clip_seconds: usize,
+}
+
+impl Default for ClipRecorderConfig {
+    fn default() -> Self {
+        Self {
+            output_dir: PathBuf::from("clips"),
+            max_clip_width: 320,
+            target_save_fps: 8,
+            pre_roll_seconds: 2,
+            post_roll_seconds: 2,
+            max_clip_seconds: 12,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ClipFrame {
+    image: RgbaImage,
+}
+
+struct ActiveClip {
+    started_at_frame: usize,
+    still_frames: usize,
+    frames: Vec<ClipFrame>,
+}
+
+struct ClipRecorder {
+    output_dir: PathBuf,
+    clip_width: u32,
+    clip_height: u32,
+    frame_stride: usize,
+    effective_fps: u32,
+    pre_roll_frames: usize,
+    post_roll_frames: usize,
+    max_clip_frames: usize,
+    recent_frames: VecDeque<ClipFrame>,
+    active_clip: Option<ActiveClip>,
+    next_clip_number: usize,
+}
+
+impl ClipRecorder {
+    fn new(
+        config: ClipRecorderConfig,
+        source_width: u32,
+        source_height: u32,
+        source_fps: u32,
+    ) -> Result<Self, Box<dyn Error>> {
+        fs::create_dir_all(&config.output_dir)?;
+
+        let clip_width = config.max_clip_width.min(source_width).max(1);
+        let clip_height = ((u64::from(source_height) * u64::from(clip_width))
+            / u64::from(source_width.max(1)))
+        .max(1) as u32;
+
+        let source_fps = source_fps.max(1);
+        let frame_stride = usize::try_from(source_fps.div_ceil(config.target_save_fps.max(1)))
+            .unwrap_or(1)
+            .max(1);
+        let effective_fps = (source_fps / frame_stride as u32).max(1);
+        let pre_roll_frames = config.pre_roll_seconds * effective_fps as usize;
+        let post_roll_frames = config.post_roll_seconds * effective_fps as usize;
+        let max_clip_frames = config.max_clip_seconds * effective_fps as usize;
+
+        Ok(Self {
+            output_dir: config.output_dir,
+            clip_width,
+            clip_height,
+            frame_stride,
+            effective_fps,
+            pre_roll_frames,
+            post_roll_frames,
+            max_clip_frames,
+            recent_frames: VecDeque::new(),
+            active_clip: None,
+            next_clip_number: 1,
+        })
+    }
+
+    fn clip_width(&self) -> u32 {
+        self.clip_width
+    }
+
+    fn clip_height(&self) -> u32 {
+        self.clip_height
+    }
+
+    fn effective_fps(&self) -> u32 {
+        self.effective_fps
+    }
+
+    fn pre_roll_frames(&self) -> usize {
+        self.pre_roll_frames
+    }
+
+    fn post_roll_frames(&self) -> usize {
+        self.post_roll_frames
+    }
+
+    fn output_dir(&self) -> &Path {
+        &self.output_dir
+    }
+
+    fn record_frame(
+        &mut self,
+        rgb_frame: &RgbImage,
+        frame_number: usize,
+        analysis: &MotionAnalysis,
+    ) -> Result<Option<PathBuf>, Box<dyn Error>> {
+        if frame_number % self.frame_stride != 0 {
+            return Ok(None);
+        }
+
+        let clip_frame = ClipFrame {
+            image: resize_for_clip(rgb_frame, self.clip_width, self.clip_height),
+        };
+
+        self.recent_frames.push_back(clip_frame.clone());
+        while self.recent_frames.len() > self.pre_roll_frames.max(1) {
+            self.recent_frames.pop_front();
+        }
+
+        let should_start_clip =
+            self.active_clip.is_none() && !analysis.warming_up && analysis.motion_detected;
+
+        if should_start_clip {
+            let seeded_frames = self.recent_frames.iter().cloned().collect();
+            self.active_clip = Some(ActiveClip {
+                started_at_frame: frame_number,
+                still_frames: 0,
+                frames: seeded_frames,
+            });
+            println!(
+                "Motion clip started at frame {frame_number}. Buffering {} pre-roll frame(s).",
+                self.recent_frames.len()
+            );
+        }
+
+        if let Some(active_clip) = &mut self.active_clip {
+            if !should_start_clip {
+                active_clip.frames.push(clip_frame);
+            }
+
+            if analysis.motion_detected {
+                active_clip.still_frames = 0;
+            } else {
+                active_clip.still_frames += 1;
+            }
+
+            if active_clip.frames.len() >= self.max_clip_frames.max(1) {
+                println!("Finishing clip because it reached the beginner-safe length limit.");
+                return self.finish_active_clip();
+            }
+
+            if active_clip.still_frames >= self.post_roll_frames.max(1) {
+                return self.finish_active_clip();
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn finish_pending_clip(&mut self) -> Result<Option<PathBuf>, Box<dyn Error>> {
+        if self.active_clip.is_none() {
+            return Ok(None);
+        }
+
+        self.finish_active_clip()
+    }
+
+    fn finish_active_clip(&mut self) -> Result<Option<PathBuf>, Box<dyn Error>> {
+        let Some(active_clip) = self.active_clip.take() else {
+            return Ok(None);
+        };
+
+        if active_clip.frames.is_empty() {
+            return Ok(None);
+        }
+
+        let clip_path = self.next_clip_path(active_clip.started_at_frame);
+        write_gif_clip(&clip_path, &active_clip.frames, self.effective_fps)?;
+        println!(
+            "Saved {} frame(s) to {}.",
+            active_clip.frames.len(),
+            clip_path.display()
+        );
+        self.next_clip_number += 1;
+
+        Ok(Some(clip_path))
+    }
+
+    fn next_clip_path(&self, started_at_frame: usize) -> PathBuf {
+        let timestamp_millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        self.output_dir.join(format!(
+            "clip_{:04}_frame_{started_at_frame}_{timestamp_millis}.gif",
+            self.next_clip_number
+        ))
+    }
+}
+
 fn run_motion_detection(
     camera: &mut Camera,
-    config: MotionDetectorConfig,
+    motion_config: MotionDetectorConfig,
+    clip_config: ClipRecorderConfig,
     max_frames: Option<usize>,
+    source_width: u32,
+    source_height: u32,
+    source_fps: u32,
 ) -> Result<(), Box<dyn Error>> {
-    let mut detector = MotionDetector::new(config);
+    let mut detector = MotionDetector::new(motion_config);
+    let mut clip_recorder =
+        ClipRecorder::new(clip_config, source_width, source_height, source_fps)?;
     let started_at = Instant::now();
     let mut frame_number = 0usize;
 
@@ -237,10 +460,19 @@ fn run_motion_detection(
     );
     println!(
         "Settings: sample {}x{}, pixel threshold {}, motion threshold {} changed pixels.",
-        config.sample_width,
-        config.sample_height,
-        config.pixel_diff_threshold,
-        config.min_changed_pixels
+        motion_config.sample_width,
+        motion_config.sample_height,
+        motion_config.pixel_diff_threshold,
+        motion_config.min_changed_pixels
+    );
+    println!(
+        "Clip saving: GIF clips in {}, {}x{} at {} FPS, {} saved pre-roll frame(s), {} saved post-roll frame(s).",
+        clip_recorder.output_dir().display(),
+        clip_recorder.clip_width(),
+        clip_recorder.clip_height(),
+        clip_recorder.effective_fps(),
+        clip_recorder.pre_roll_frames(),
+        clip_recorder.post_roll_frames()
     );
 
     loop {
@@ -252,22 +484,29 @@ fn run_motion_detection(
 
         frame_number += 1;
         let frame = camera.frame()?;
-        let grayscale = frame.decode_image::<LumaFormat>()?;
-        let analysis = detector.analyze_frame(
-            grayscale.as_raw(),
-            grayscale.width() as usize,
-            grayscale.height() as usize,
+        let rgb = frame.decode_image::<RgbFormat>()?;
+        let sampled_grayscale = sample_rgb_frame_to_grayscale(
+            rgb.as_raw(),
+            rgb.width() as usize,
+            rgb.height() as usize,
+            motion_config.sample_width,
+            motion_config.sample_height,
         );
+        let analysis = detector.analyze_frame(sampled_grayscale);
+
+        let _ = clip_recorder.record_frame(&rgb, frame_number, &analysis)?;
 
         let should_print = analysis.warming_up
             || analysis.motion_started
             || analysis.motion_ended
-            || frame_number % config.report_every_n_frames == 0;
+            || frame_number % motion_config.report_every_n_frames == 0;
 
         if should_print {
             print_motion_status(frame_number, &analysis, started_at.elapsed());
         }
     }
+
+    let _ = clip_recorder.finish_pending_clip()?;
 
     let elapsed_seconds = started_at.elapsed().as_secs_f64();
     let fps = frame_number as f64 / elapsed_seconds.max(0.001);
@@ -305,8 +544,8 @@ fn print_motion_status(frame_number: usize, analysis: &MotionAnalysis, elapsed: 
     );
 }
 
-fn sample_grayscale_frame(
-    grayscale_pixels: &[u8],
+fn sample_rgb_frame_to_grayscale(
+    rgb_pixels: &[u8],
     source_width: usize,
     source_height: usize,
     sample_width: usize,
@@ -320,7 +559,11 @@ fn sample_grayscale_frame(
 
         for sample_x in 0..sample_width {
             let source_x = sample_x * source_width / sample_width;
-            sampled.push(grayscale_pixels[row_start + source_x]);
+            let rgb_index = (row_start + source_x) * 3;
+            let red = u16::from(rgb_pixels[rgb_index]);
+            let green = u16::from(rgb_pixels[rgb_index + 1]);
+            let blue = u16::from(rgb_pixels[rgb_index + 2]);
+            sampled.push(((red + green + blue) / 3) as u8);
         }
     }
 
@@ -335,22 +578,46 @@ fn count_changed_pixels(previous_frame: &[u8], current_frame: &[u8], threshold: 
         .count()
 }
 
+fn resize_for_clip(rgb_frame: &RgbImage, clip_width: u32, clip_height: u32) -> RgbaImage {
+    let resized = image::imageops::resize(rgb_frame, clip_width, clip_height, FilterType::Triangle);
+    DynamicImage::ImageRgb8(resized).into_rgba8()
+}
+
+fn write_gif_clip(
+    output_path: &Path,
+    frames: &[ClipFrame],
+    effective_fps: u32,
+) -> Result<(), Box<dyn Error>> {
+    let file = File::create(output_path)?;
+    let writer = BufWriter::new(file);
+    let mut encoder = GifEncoder::new(writer);
+    encoder.set_repeat(Repeat::Infinite)?;
+    let delay = Delay::from_numer_denom_ms(1000, effective_fps.max(1));
+
+    for clip_frame in frames {
+        let gif_frame = Frame::from_parts(clip_frame.image.clone(), 0, 0, delay);
+        encoder.encode_frame(gif_frame)?;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        MotionDetector, MotionDetectorConfig, count_changed_pixels, sample_grayscale_frame,
+        MotionDetector, MotionDetectorConfig, count_changed_pixels, sample_rgb_frame_to_grayscale,
     };
 
     #[test]
-    fn sampling_picks_evenly_spaced_pixels() {
+    fn rgb_sampling_picks_evenly_spaced_pixels() {
         let source = vec![
-            0, 1, 2, 3, //
-            4, 5, 6, 7, //
-            8, 9, 10, 11, //
-            12, 13, 14, 15,
+            0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, //
+            4, 4, 4, 5, 5, 5, 6, 6, 6, 7, 7, 7, //
+            8, 8, 8, 9, 9, 9, 10, 10, 10, 11, 11, 11, //
+            12, 12, 12, 13, 13, 13, 14, 14, 14, 15, 15, 15,
         ];
 
-        let sampled = sample_grayscale_frame(&source, 4, 4, 2, 2);
+        let sampled = sample_rgb_frame_to_grayscale(&source, 4, 4, 2, 2);
         assert_eq!(sampled, vec![0, 2, 8, 10]);
     }
 
@@ -373,18 +640,18 @@ mod tests {
         };
         let mut detector = MotionDetector::new(config);
 
-        let first = detector.analyze_frame(&[10, 10, 10, 10], 2, 2);
+        let first = detector.analyze_frame(vec![10, 10, 10, 10]);
         assert!(first.warming_up);
 
-        let second = detector.analyze_frame(&[10, 10, 40, 40], 2, 2);
+        let second = detector.analyze_frame(vec![10, 10, 40, 40]);
         assert!(second.motion_started);
         assert!(second.motion_detected);
 
-        let third = detector.analyze_frame(&[10, 10, 10, 10], 2, 2);
+        let third = detector.analyze_frame(vec![10, 10, 10, 10]);
         assert!(!third.motion_ended);
         assert!(third.motion_detected);
 
-        let fourth = detector.analyze_frame(&[10, 10, 10, 10], 2, 2);
+        let fourth = detector.analyze_frame(vec![10, 10, 10, 10]);
         assert!(fourth.motion_ended);
         assert!(!fourth.motion_detected);
     }
