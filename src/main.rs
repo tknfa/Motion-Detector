@@ -58,13 +58,23 @@ fn main() -> Result<(), Box<dyn Error>> {
             capture_info.width, capture_info.height, capture_info.frame_rate
         );
 
-        run_motion_detection(
+        let clip_config = ClipRecorderConfig::default();
+        let (save_sender, save_handle) = spawn_clip_saver_thread(clip_config, capture_info);
+
+        let detect_result = run_motion_detection(
             receiver,
+            save_sender,
             MotionDetectorConfig::default(),
-            ClipRecorderConfig::default(),
             args.max_frames,
-            capture_info,
-        )
+        );
+        let save_result = match save_handle.join() {
+            Ok(result) => result.map_err(|message| -> Box<dyn Error> { message.into() }),
+            Err(_) => Err("The clip saver thread panicked.".into()),
+        };
+
+        detect_result?;
+        save_result?;
+        Ok(())
     })();
 
     if capture_handle.join().is_err() {
@@ -158,10 +168,23 @@ struct CapturedFrame {
     rgb: RgbImage,
 }
 
+#[derive(Clone, Copy)]
+struct SaveFrame {
+    frame_number: usize,
+    analysis: MotionAnalysis,
+}
+
 enum CaptureMessage {
     Started(CaptureInfo),
     Frame(CapturedFrame),
     Error(String),
+}
+
+enum SaveMessage {
+    Frame {
+        captured_frame: CapturedFrame,
+        analysis: MotionAnalysis,
+    },
 }
 
 fn spawn_capture_thread(camera_index: u32) -> (Receiver<CaptureMessage>, thread::JoinHandle<()>) {
@@ -307,6 +330,7 @@ impl MotionDetector {
     }
 }
 
+#[derive(Clone, Copy)]
 struct MotionAnalysis {
     changed_pixels: usize,
     total_pixels: usize,
@@ -362,6 +386,63 @@ struct ClipRecorder {
     recent_frames: VecDeque<ClipFrame>,
     active_clip: Option<ActiveClip>,
     next_clip_number: usize,
+}
+
+fn spawn_clip_saver_thread(
+    config: ClipRecorderConfig,
+    capture_info: CaptureInfo,
+) -> (
+    SyncSender<SaveMessage>,
+    thread::JoinHandle<Result<(), String>>,
+) {
+    let (sender, receiver) = sync_channel(8);
+    let handle = thread::spawn(move || {
+        clip_saver_loop(receiver, config, capture_info).map_err(|error| error.to_string())
+    });
+
+    (sender, handle)
+}
+
+fn clip_saver_loop(
+    receiver: Receiver<SaveMessage>,
+    clip_config: ClipRecorderConfig,
+    capture_info: CaptureInfo,
+) -> Result<(), Box<dyn Error>> {
+    let mut clip_recorder = ClipRecorder::new(
+        clip_config,
+        capture_info.width,
+        capture_info.height,
+        capture_info.frame_rate,
+    )?;
+
+    println!("Clip saving is running on its own thread.");
+    println!(
+        "Clip saving: GIF clips in {}, {}x{} at {} FPS, {} saved pre-roll frame(s), {} saved post-roll frame(s).",
+        clip_recorder.output_dir().display(),
+        clip_recorder.clip_width(),
+        clip_recorder.clip_height(),
+        clip_recorder.effective_fps(),
+        clip_recorder.pre_roll_frames(),
+        clip_recorder.post_roll_frames()
+    );
+
+    while let Ok(message) = receiver.recv() {
+        match message {
+            SaveMessage::Frame {
+                captured_frame,
+                analysis,
+            } => {
+                let save_frame = SaveFrame {
+                    frame_number: captured_frame.frame_number,
+                    analysis,
+                };
+                let _ = clip_recorder.record_frame(&captured_frame.rgb, &save_frame)?;
+            }
+        }
+    }
+
+    let _ = clip_recorder.finish_pending_clip()?;
+    Ok(())
 }
 
 impl ClipRecorder {
@@ -429,9 +510,11 @@ impl ClipRecorder {
     fn record_frame(
         &mut self,
         rgb_frame: &RgbImage,
-        frame_number: usize,
-        analysis: &MotionAnalysis,
+        save_frame: &SaveFrame,
     ) -> Result<Option<PathBuf>, Box<dyn Error>> {
+        let frame_number = save_frame.frame_number;
+        let analysis = save_frame.analysis;
+
         if frame_number % self.frame_stride != 0 {
             return Ok(None);
         }
@@ -534,23 +617,16 @@ impl ClipRecorder {
 
 fn run_motion_detection(
     receiver: Receiver<CaptureMessage>,
+    save_sender: SyncSender<SaveMessage>,
     motion_config: MotionDetectorConfig,
-    clip_config: ClipRecorderConfig,
     max_frames: Option<usize>,
-    capture_info: CaptureInfo,
 ) -> Result<(), Box<dyn Error>> {
     let mut detector = MotionDetector::new(motion_config);
-    let mut clip_recorder = ClipRecorder::new(
-        clip_config,
-        capture_info.width,
-        capture_info.height,
-        capture_info.frame_rate,
-    )?;
     let started_at = Instant::now();
     let mut processed_frames = 0usize;
 
     println!(
-        "Motion detection and clip saving are running on the main thread.{}",
+        "Motion detection is running on the main thread.{}",
         match max_frames {
             Some(limit) => format!(" It will stop after {limit} frames."),
             None => " Press Ctrl+C to stop.".to_string(),
@@ -562,15 +638,6 @@ fn run_motion_detection(
         motion_config.sample_height,
         motion_config.pixel_diff_threshold,
         motion_config.min_changed_pixels
-    );
-    println!(
-        "Clip saving: GIF clips in {}, {}x{} at {} FPS, {} saved pre-roll frame(s), {} saved post-roll frame(s).",
-        clip_recorder.output_dir().display(),
-        clip_recorder.clip_width(),
-        clip_recorder.clip_height(),
-        clip_recorder.effective_fps(),
-        clip_recorder.pre_roll_frames(),
-        clip_recorder.post_roll_frames()
     );
 
     loop {
@@ -603,7 +670,12 @@ fn run_motion_detection(
         );
         let analysis = detector.analyze_frame(sampled_grayscale);
 
-        let _ = clip_recorder.record_frame(&rgb, frame_number, &analysis)?;
+        save_sender
+            .send(SaveMessage::Frame {
+                captured_frame: CapturedFrame { frame_number, rgb },
+                analysis,
+            })
+            .map_err(|_| "The clip saver thread stopped receiving frames.")?;
 
         let should_print = analysis.warming_up
             || analysis.motion_started
@@ -614,8 +686,6 @@ fn run_motion_detection(
             print_motion_status(frame_number, &analysis, started_at.elapsed());
         }
     }
-
-    let _ = clip_recorder.finish_pending_clip()?;
 
     let elapsed_seconds = started_at.elapsed().as_secs_f64();
     let fps = processed_frames as f64 / elapsed_seconds.max(0.001);
