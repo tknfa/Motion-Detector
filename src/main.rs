@@ -4,6 +4,7 @@ use std::{
     fs::{self, File},
     io::BufWriter,
     path::{Path, PathBuf},
+    process::Command,
     sync::{
         Arc, Mutex,
         mpsc::{Receiver, SyncSender, sync_channel},
@@ -60,10 +61,12 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         let clip_config = ClipRecorderConfig::default();
         let (save_sender, save_handle) = spawn_clip_saver_thread(clip_config, capture_info);
+        let (alert_sender, alert_handle) = spawn_alert_thread();
 
         let detect_result = run_motion_detection(
             receiver,
             save_sender,
+            alert_sender,
             MotionDetectorConfig::default(),
             args.max_frames,
         );
@@ -71,9 +74,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             Ok(result) => result.map_err(|message| -> Box<dyn Error> { message.into() }),
             Err(_) => Err("The clip saver thread panicked.".into()),
         };
+        let alert_result = match alert_handle.join() {
+            Ok(result) => result.map_err(|message| -> Box<dyn Error> { message.into() }),
+            Err(_) => Err("The alert thread panicked.".into()),
+        };
 
         detect_result?;
         save_result?;
+        alert_result?;
         Ok(())
     })();
 
@@ -185,6 +193,19 @@ enum SaveMessage {
         captured_frame: CapturedFrame,
         analysis: MotionAnalysis,
     },
+}
+
+#[derive(Clone, Copy)]
+struct AlertEvent {
+    frame_number: usize,
+    changed_pixels: usize,
+    total_pixels: usize,
+    elapsed: Duration,
+}
+
+enum AlertMessage {
+    MotionStarted(AlertEvent),
+    MotionEnded(AlertEvent),
 }
 
 fn spawn_capture_thread(camera_index: u32) -> (Receiver<CaptureMessage>, thread::JoinHandle<()>) {
@@ -445,6 +466,73 @@ fn clip_saver_loop(
     Ok(())
 }
 
+fn spawn_alert_thread() -> (
+    SyncSender<AlertMessage>,
+    thread::JoinHandle<Result<(), String>>,
+) {
+    let (sender, receiver) = sync_channel(16);
+    let handle = thread::spawn(move || alert_loop(receiver).map_err(|error| error.to_string()));
+
+    (sender, handle)
+}
+
+fn alert_loop(receiver: Receiver<AlertMessage>) -> Result<(), Box<dyn Error>> {
+    println!("Alerts are running on their own thread.");
+
+    while let Ok(message) = receiver.recv() {
+        match message {
+            AlertMessage::MotionStarted(event) => {
+                let body = format_alert_body(event, "started");
+                println!("[ALERT {:>6.2}s] {body}", event.elapsed.as_secs_f64());
+
+                if let Err(error) = send_desktop_notification("Motion Started", &body) {
+                    println!("Desktop notification failed: {error}");
+                }
+            }
+            AlertMessage::MotionEnded(event) => {
+                let body = format_alert_body(event, "ended");
+                println!("[ALERT {:>6.2}s] {body}", event.elapsed.as_secs_f64());
+
+                if let Err(error) = send_desktop_notification("Motion Ended", &body) {
+                    println!("Desktop notification failed: {error}");
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn format_alert_body(event: AlertEvent, state: &str) -> String {
+    format!(
+        "Motion {state} at frame {} ({}/{} sampled pixels changed).",
+        event.frame_number, event.changed_pixels, event.total_pixels
+    )
+}
+
+fn send_desktop_notification(title: &str, body: &str) -> Result<(), Box<dyn Error>> {
+    if !cfg!(target_os = "macos") {
+        return Err("Desktop notifications are only implemented for macOS right now.".into());
+    }
+
+    let script = format!(
+        "display notification \"{}\" with title \"Motion Detector\" subtitle \"{}\"",
+        escape_applescript_string(body),
+        escape_applescript_string(title)
+    );
+    let status = Command::new("osascript").args(["-e", &script]).status()?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("osascript exited with status {status}.").into())
+    }
+}
+
+fn escape_applescript_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 impl ClipRecorder {
     fn new(
         config: ClipRecorderConfig,
@@ -618,6 +706,7 @@ impl ClipRecorder {
 fn run_motion_detection(
     receiver: Receiver<CaptureMessage>,
     save_sender: SyncSender<SaveMessage>,
+    alert_sender: SyncSender<AlertMessage>,
     motion_config: MotionDetectorConfig,
     max_frames: Option<usize>,
 ) -> Result<(), Box<dyn Error>> {
@@ -676,6 +765,25 @@ fn run_motion_detection(
                 analysis,
             })
             .map_err(|_| "The clip saver thread stopped receiving frames.")?;
+
+        let alert_event = AlertEvent {
+            frame_number,
+            changed_pixels: analysis.changed_pixels,
+            total_pixels: analysis.total_pixels,
+            elapsed: started_at.elapsed(),
+        };
+
+        if analysis.motion_started {
+            alert_sender
+                .send(AlertMessage::MotionStarted(alert_event))
+                .map_err(|_| "The alert thread stopped receiving events.")?;
+        }
+
+        if analysis.motion_ended {
+            alert_sender
+                .send(AlertMessage::MotionEnded(alert_event))
+                .map_err(|_| "The alert thread stopped receiving events.")?;
+        }
 
         let should_print = analysis.warming_up
             || analysis.motion_started
