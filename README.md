@@ -6,7 +6,7 @@ This is a Rust project I made that uses a Mac webcam to detect motion, save clip
 
 ## About
 
-I made this project to practice Rust and learn more about threads in a real program instead of only doing small examples. The app watches a webcam feed, looks for motion by comparing frames, saves short GIF clips when motion happens, and sends alerts when motion starts and ends.
+The app watches a webcam feed, looks for motion by comparing frames, saves short GIF clips when motion happens, and sends alerts when motion starts and ends.
 
 - Written in Rust
 - Made for macOS webcams
